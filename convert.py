@@ -252,14 +252,6 @@ def tts_kokoro(text: str, output_path: str, voice: str = None) -> bool:
         wav_path = output_path.rsplit('.', 1)[0] + '.wav'
         sf.write(wav_path, samples, sample_rate)
         
-        # Check WAV was created
-        if os.path.exists(wav_path):
-            wav_size = os.path.getsize(wav_path)
-            print(f"      [kokoro] Generated WAV: {wav_size:,} bytes, {len(samples)/sample_rate:.1f}s")
-        else:
-            print(f"      [kokoro] ERROR: WAV not created!")
-            return False
-        
         # Convert to MP3
         result = subprocess.run([
             'ffmpeg', '-y', '-i', wav_path,
@@ -269,14 +261,6 @@ def tts_kokoro(text: str, output_path: str, voice: str = None) -> bool:
         
         if result.returncode != 0:
             print(f"      [kokoro] FFmpeg error: {result.stderr}")
-            return False
-        
-        # Check MP3 was created
-        if os.path.exists(output_path):
-            mp3_size = os.path.getsize(output_path)
-            print(f"      [kokoro] Converted MP3: {mp3_size:,} bytes")
-        else:
-            print(f"      [kokoro] ERROR: MP3 not created!")
             return False
         
         os.remove(wav_path)
@@ -455,7 +439,6 @@ def capture_animation_states(pptx_path: str, slide_index: int, num_clicks: int,
 def get_audio_duration(audio_path: str) -> float:
     """Get duration of an audio file in seconds."""
     if not os.path.exists(audio_path):
-        print(f"      [duration] WARNING: Audio file not found: {audio_path}")
         return 0.0
         
     result = subprocess.run([
@@ -464,39 +447,31 @@ def get_audio_duration(audio_path: str) -> float:
     ], capture_output=True, text=True)
     
     if result.returncode != 0 or not result.stdout.strip():
-        print(f"      [duration] WARNING: Could not get duration: {result.stderr}")
         return 0.0
     
     try:
-        duration = float(result.stdout.strip())
-        print(f"      [duration] Audio duration: {duration:.1f}s")
-        return duration
+        return float(result.stdout.strip())
     except ValueError:
-        print(f"      [duration] WARNING: Invalid duration: {result.stdout}")
         return 0.0
 
 
 def add_padding_to_audio(input_path: str, output_path: str, padding: float):
     """Add silence padding before and after audio."""
-    # Use adelay for start padding and apad for end padding
-    # Convert padding to milliseconds for adelay
     delay_ms = int(padding * 1000)
     
     result = subprocess.run([
         'ffmpeg', '-y',
         '-i', input_path,
         '-af', f'adelay={delay_ms}|{delay_ms},apad=pad_dur={padding}',
-        '-acodec', 'aac', '-b:a', '192k',
+        '-ac', '2',              # Force stereo
+        '-ar', '44100',          # Force 44.1kHz
+        '-acodec', 'aac', 
+        '-b:a', '192k',
         output_path
     ], capture_output=True, text=True)
     
     if result.returncode != 0:
-        print(f"      [padding] FFmpeg error: {result.stderr}")
-        raise RuntimeError(f"Audio padding failed: {result.stderr}")
-    
-    if os.path.exists(output_path):
-        size = os.path.getsize(output_path)
-        print(f"      [padding] Padded audio: {size:,} bytes")
+        raise RuntimeError(f"Audio padding failed: {result.stderr[:500] if result.stderr else 'Unknown error'}")
 
 
 # =============================================================================
@@ -506,43 +481,27 @@ def add_padding_to_audio(input_path: str, output_path: str, padding: float):
 def create_slide_video(image_path: str, audio_path: str, duration: float,
                        output_path: str):
     """Create a video clip from a single image and audio."""
-    # Verify inputs exist
-    if not os.path.exists(image_path):
-        raise FileNotFoundError(f"Image not found: {image_path}")
-    if not os.path.exists(audio_path):
-        raise FileNotFoundError(f"Audio not found: {audio_path}")
+    result = subprocess.run([
+        'ffmpeg', '-y',
+        '-loop', '1',
+        '-i', image_path,
+        '-i', audio_path,
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-tune', 'stillimage',
+        '-c:a', 'aac',
+        '-ac', '2',              # Force stereo
+        '-ar', '44100',          # Force 44.1kHz sample rate
+        '-b:a', '192k',
+        '-pix_fmt', 'yuv420p',
+        '-shortest',
+        '-t', str(duration),
+        '-r', str(OUTPUT_FPS),
+        output_path
+    ], capture_output=True, text=True)
     
-    audio_size = os.path.getsize(audio_path)
-    print(f"      [video] Creating from image + audio ({audio_size:,} bytes), duration={duration:.1f}s")
-    
-    try:
-        result = subprocess.run([
-            'ffmpeg', '-y',
-            '-loop', '1',
-            '-i', image_path,
-            '-i', audio_path,
-            '-c:v', 'libx264',
-            '-tune', 'stillimage',
-            '-c:a', 'aac',
-            '-b:a', '192k',
-            '-pix_fmt', 'yuv420p',
-            '-shortest',
-            '-t', str(duration),
-            '-r', str(OUTPUT_FPS),
-            output_path
-        ], capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            print(f"      [video] FFmpeg error: {result.stderr}")
-            raise RuntimeError(f"Video creation failed")
-            
-        if os.path.exists(output_path):
-            size = os.path.getsize(output_path)
-            print(f"      [video] Created: {size:,} bytes")
-            
-    except subprocess.CalledProcessError as e:
-        print(f"FFmpeg error creating slide video: {e.stderr}")
-        raise
+    if result.returncode != 0:
+        raise RuntimeError(f"Video creation failed: {result.stderr[:500] if result.stderr else 'Unknown error'}")
 
 
 def create_silent_slide_video(image_path: str, duration: float, output_path: str):
@@ -552,10 +511,14 @@ def create_silent_slide_video(image_path: str, duration: float, output_path: str
             'ffmpeg', '-y',
             '-loop', '1',
             '-i', image_path,
-            '-f', 'lavfi', '-i', f'anullsrc=r={OUTPUT_AUDIO_RATE}:cl=stereo',
+            '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',  # Explicit stereo 44.1kHz
             '-c:v', 'libx264',
+            '-preset', 'veryfast',
             '-tune', 'stillimage',
             '-c:a', 'aac',
+            '-ac', '2',              # Force stereo
+            '-ar', '44100',          # Force 44.1kHz sample rate
+            '-b:a', '192k',
             '-pix_fmt', 'yuv420p',
             '-t', str(duration),
             '-r', str(OUTPUT_FPS),
@@ -572,48 +535,70 @@ def concatenate_videos(video_paths: list[str], output_path: str):
         shutil.copy(video_paths[0], output_path)
         return
     
-    # Debug: Check each video for audio
-    print("  Checking video clips...")
-    for vp in video_paths:
-        # Check if video has audio stream
-        result = subprocess.run([
-            'ffprobe', '-v', 'error', '-select_streams', 'a',
-            '-show_entries', 'stream=codec_name',
-            '-of', 'default=noprint_wrappers=1:nokey=1', vp
-        ], capture_output=True, text=True)
-        audio_codec = result.stdout.strip() if result.stdout else "NO AUDIO"
-        size = os.path.getsize(vp) if os.path.exists(vp) else 0
-        print(f"    {os.path.basename(vp)}: {size:,} bytes, audio: {audio_codec}")
+    print(f"  Concatenating {len(video_paths)} video clips...")
     
-    # Use file-based concatenation (more reliable on Windows)
-    # Create a temp file listing all videos
-    list_file = os.path.join(os.path.dirname(video_paths[0]), "concat_list.txt")
+    # Get the directory containing the videos
+    base_dir = os.path.dirname(video_paths[0])
+    list_file = os.path.join(base_dir, "concat_list.txt")
     
+    # Write concat list using just filenames (relative paths)
     with open(list_file, "w", encoding="utf-8") as f:
         for vp in video_paths:
-            # FFmpeg concat demuxer needs forward slashes and escaped quotes
-            safe_path = vp.replace("\\", "/")
-            f.write(f"file '{safe_path}'\n")
+            filename = os.path.basename(vp)
+            f.write(f"file '{filename}'\n")
     
+    # Get absolute path for output
+    output_abs = os.path.abspath(output_path)
+    
+    # First try with stream copy (fast, no re-encoding)
     cmd = [
         "ffmpeg", "-y",
         "-f", "concat",
         "-safe", "0",
-        "-i", list_file,
-        "-c:v", "libx264",
-        "-c:a", "aac",
+        "-i", "concat_list.txt",
+        "-c", "copy",
         "-movflags", "+faststart",
-        output_path
+        output_abs
     ]
     
     try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
-        print(f"FFmpeg concatenation failed!")
-        print(f"stderr: {e.stderr}")
-        raise
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, cwd=base_dir)
+        if result.returncode == 0:
+            if os.path.exists(list_file):
+                os.remove(list_file)
+            return
+        else:
+            print(f"  Stream copy failed, trying re-encode...")
+    except subprocess.TimeoutExpired:
+        print(f"  Timeout, trying re-encode...")
+    except Exception as e:
+        print(f"  Copy failed: {e}, trying re-encode...")
+    
+    # Fallback: re-encode with explicit consistent parameters
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", "concat_list.txt",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-c:a", "aac",
+        "-ac", "2",              # Force stereo
+        "-ar", "44100",          # Force 44.1kHz
+        "-b:a", "192k",
+        "-movflags", "+faststart",
+        output_abs
+    ]
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, cwd=base_dir)
+        if result.returncode != 0:
+            print(f"  Concatenation failed! FFmpeg error:")
+            print(f"  {result.stderr[:1500] if result.stderr else 'No error message'}")
+            raise RuntimeError("Concatenation failed")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Concatenation timed out")
     finally:
-        # Cleanup list file
         if os.path.exists(list_file):
             os.remove(list_file)
 
